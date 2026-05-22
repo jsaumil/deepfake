@@ -1,17 +1,23 @@
 """
 evaluate.py
 ===========
-Evaluation script — computes all metrics from the flow diagram:
-  • AUC-ROC
-  • F1-score
-  • Accuracy
-  • Precision
-  • Loss (binary cross-entropy)
-  • Confusion Matrix  (TP / TN / FP / FN)
+Evaluation script — all 6 metrics from the flow diagram:
+  • AUC-ROC  (area under ROC curve)
+  • F1-score  (harmonic mean P & R)
+  • Accuracy  (correct predictions / total)
+  • Precision  (TP / predicted positives)
+  • Loss  (binary cross-entropy)
+  • Confusion Matrix  (TP · TN · FP · FN)
+
+UPDATED: Now evaluates video sequences [B, seq_len, 3, H, W] 
+         instead of single images.
 
 Usage:
-  python evaluate.py --checkpoint checkpoints/fusion_best.pt \
-                     --data_root ./data --split test
+  python evaluate.py \
+      --checkpoint checkpoints/fusion_best.pt \
+      --data_root  ./data \
+      --frames_dir ./frames_cache \
+      --split      test
 """
 
 import argparse
@@ -25,34 +31,26 @@ from sklearn.metrics import (
     precision_score, confusion_matrix, roc_curve,
 )
 
-from dataset import build_dataloaders
+from dataset import build_ff_dataloaders
 from fusion_model import DeepFakeFusionDetector
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Core evaluation loop
-# ──────────────────────────────────────────────────────────────────────────────
-
 @torch.no_grad()
-def evaluate(
-    model: DeepFakeFusionDetector,
-    loader,
-    device: torch.device,
-    threshold: float = 0.5,
-) -> dict:
+def evaluate(model, loader, device, threshold=0.5):
     model.eval()
     criterion  = nn.BCEWithLogitsLoss()
     total_loss = 0.0
     all_labels, all_probs = [], []
 
-    for imgs, labels in tqdm(loader, desc="Evaluating"):
-        imgs   = imgs.to(device)
-        labels_f = labels.float().unsqueeze(1).to(device)
-
-        logits = model(imgs)
-        loss   = criterion(logits, labels_f)
-        total_loss += loss.item()
-
+    for clips, labels in tqdm(loader, desc="Evaluating"):
+        # clips shape: [B, seq_len, 3, H, W]
+        clips     = clips.to(device)
+        labels_f  = labels.float().unsqueeze(1).to(device)
+        
+        # Model must accept sequence input and output [B, 1] logits
+        logits   = model(clips)
+        
+        total_loss += criterion(logits, labels_f).item()
         all_probs.extend(logits.sigmoid().squeeze(1).cpu().tolist())
         all_labels.extend(labels.cpu().tolist())
 
@@ -64,50 +62,39 @@ def evaluate(
     tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
 
     metrics = {
-        "loss":           total_loss / len(loader),
-        "auc_roc":        roc_auc_score(labels_np, probs_np) if len(set(labels_np)) > 1 else 0.0,
-        "f1_score":       f1_score(labels_np, preds_np, zero_division=0),
-        "accuracy":       accuracy_score(labels_np, preds_np),
-        "precision":      precision_score(labels_np, preds_np, zero_division=0),
-        "confusion_matrix": {
-            "TP": int(tp), "TN": int(tn),
-            "FP": int(fp), "FN": int(fn),
-        },
-        "threshold": threshold,
-        "n_samples": len(labels_np),
+        "loss":             total_loss / max(len(loader), 1),
+        "auc_roc":          roc_auc_score(labels_np, probs_np) if len(set(labels_np)) > 1 else 0.0,
+        "f1_score":         f1_score(labels_np, preds_np, zero_division=0),
+        "accuracy":         accuracy_score(labels_np, preds_np),
+        "precision":        precision_score(labels_np, preds_np, zero_division=0),
+        "confusion_matrix": {"TP": int(tp), "TN": int(tn), "FP": int(fp), "FN": int(fn)},
+        "threshold":        threshold,
+        "n_samples":        len(labels_np),
     }
     return metrics, probs_np, labels_np
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Pretty printer
-# ──────────────────────────────────────────────────────────────────────────────
-
-def print_metrics(metrics: dict):
+def print_metrics(metrics):
     cm = metrics["confusion_matrix"]
-    print("\n" + "="*50)
+    print("\n" + "="*52)
     print("  DeepFake Detection — Evaluation Results")
-    print("="*50)
-    print(f"  Samples       : {metrics['n_samples']}")
+    print("="*52)
+    print(f"  Videos        : {metrics['n_samples']}")
     print(f"  Threshold     : {metrics['threshold']:.2f}")
-    print("-"*50)
+    print("-"*52)
     print(f"  Loss (BCE)    : {metrics['loss']:.4f}")
     print(f"  AUC-ROC       : {metrics['auc_roc']:.4f}")
     print(f"  F1-score      : {metrics['f1_score']:.4f}")
     print(f"  Accuracy      : {metrics['accuracy']:.4f}")
     print(f"  Precision     : {metrics['precision']:.4f}")
-    print("-"*50)
+    print("-"*52)
     print("  Confusion Matrix:")
-    print(f"    TP={cm['TP']:5d}   FP={cm['FP']:5d}")
-    print(f"    FN={cm['FN']:5d}   TN={cm['TN']:5d}")
-    print("="*50)
+    print(f"    TP={cm['TP']:6d}   FP={cm['FP']:6d}")
+    print(f"    FN={cm['FN']:6d}   TN={cm['TN']:6d}")
+    print("="*52)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Optional: plot ROC curve (saved to file)
-# ──────────────────────────────────────────────────────────────────────────────
-
-def plot_roc(labels, probs, save_path: str = "roc_curve.png"):
+def plot_roc(labels, probs, save_path="roc_curve.png"):
     try:
         import matplotlib.pyplot as plt
         fpr, tpr, _ = roc_curve(labels, probs)
@@ -117,7 +104,7 @@ def plot_roc(labels, probs, save_path: str = "roc_curve.png"):
         plt.plot([0, 1], [0, 1], "k--")
         plt.xlabel("False Positive Rate")
         plt.ylabel("True Positive Rate")
-        plt.title("ROC Curve — DeepFake Detector")
+        plt.title("ROC Curve — DeepFake Fusion Detector")
         plt.legend()
         plt.tight_layout()
         plt.savefig(save_path, dpi=150)
@@ -126,63 +113,55 @@ def plot_roc(labels, probs, save_path: str = "roc_curve.png"):
         print("[skip] matplotlib not installed — skipping ROC plot")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  Entry point
-# ──────────────────────────────────────────────────────────────────────────────
-
 def parse_args():
-    p = argparse.ArgumentParser(description="DeepFake Fusion Detector — Evaluation")
-    p.add_argument("--checkpoint",    type=str, required=True,
-                   help="Path to fusion model checkpoint (.pt)")
-    p.add_argument("--data_root",     type=str, default="./data")
-    p.add_argument("--split",         type=str, default="test", choices=["train","val","test"])
-    p.add_argument("--dataset_type",  type=str, default="image", choices=["image","video"])
-    p.add_argument("--batch_size",    type=int, default=32)
-    p.add_argument("--num_workers",   type=int, default=4)
-    p.add_argument("--device",        type=str, default="auto")
-    p.add_argument("--threshold",     type=float, default=0.5)
-    p.add_argument("--swin_embed_dim",type=int, default=96)
-    p.add_argument("--gan_embed_dim", type=int, default=64)
-    p.add_argument("--plot_roc",      action="store_true")
-    p.add_argument("--save_results",  type=str, default=None,
-                   help="Save metrics JSON to this path")
+    p = argparse.ArgumentParser()
+    p.add_argument("--checkpoint",     type=str, required=True)
+    p.add_argument("--data_root",      type=str, default="./data")
+    p.add_argument("--frames_dir",     type=str, default="./frames_cache")
+    p.add_argument("--split",          type=str, default="test", choices=["train","val","test"])
+    p.add_argument("--max_frames",     type=int, default=30, help="Max frames extracted per video to disk")
+    p.add_argument("--seq_len",        type=int, default=8, help="Number of frames per video sequence passed to model")
+    p.add_argument("--batch_size",     type=int, default=8, help="Batch size (videos per batch)")
+    p.add_argument("--num_workers",    type=int, default=4)
+    p.add_argument("--device",         type=str, default="auto")
+    p.add_argument("--threshold",      type=float, default=0.5)
+    p.add_argument("--swin_embed_dim", type=int, default=96)
+    p.add_argument("--gan_embed_dim",  type=int, default=64)
+    p.add_argument("--plot_roc",       action="store_true")
+    p.add_argument("--save_results",   type=str, default=None)
     return p.parse_args()
 
 
 def main():
-    args = parse_args()
-
+    args   = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu") \
              if args.device == "auto" else torch.device(args.device)
     print(f"Device: {device}")
 
-    # Load model
     model = DeepFakeFusionDetector(
         swin_embed_dim=args.swin_embed_dim,
         gan_embed_dim=args.gan_embed_dim,
     ).to(device)
+    
+    ckpt  = torch.load(args.checkpoint, map_location=device)
+    model.load_state_dict(ckpt.get("state", ckpt), strict=False)
+    print(f"Loaded ← {args.checkpoint}")
 
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    state = ckpt.get("state", ckpt)   # handle both raw and wrapped checkpoints
-    model.load_state_dict(state, strict=False)
-    print(f"Loaded checkpoint ← {args.checkpoint}")
-
-    # Build loader for the chosen split only
-    loaders = build_dataloaders(
-        data_root    = args.data_root,
-        batch_size   = args.batch_size,
-        num_workers  = args.num_workers,
-        enhance      = False,
-        dataset_type = args.dataset_type,
+    loaders = build_ff_dataloaders(
+        data_root   = args.data_root,
+        frames_dir  = args.frames_dir,
+        batch_size  = args.batch_size,
+        num_workers = args.num_workers,
+        max_frames  = args.max_frames,
+        seq_len     = args.seq_len,
+        enhance     = False,
     )
-    loader = loaders[args.split]
 
-    metrics, probs, labels = evaluate(model, loader, device, args.threshold)
+    metrics, probs, labels = evaluate(model, loaders[args.split], device, args.threshold)
     print_metrics(metrics)
 
     if args.plot_roc:
         plot_roc(labels, probs)
-
     if args.save_results:
         with open(args.save_results, "w") as f:
             json.dump(metrics, f, indent=2)

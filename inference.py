@@ -3,19 +3,22 @@ inference.py
 ============
 Run the DeepFake Fusion Detector on a single image or video file.
 
+UPDATED: Now constructs temporal sequences (B, seq_len, 3, H, W) to properly 
+utilize the LSTM/video aggregation inside the Fusion model.
+
 Output:
   - Prediction: REAL or FAKE
   - Confidence score (0–100%)
-  - Per-frame results for video
+  - Per-frame breakdown for videos (optional)
 
 Usage:
-  # Single image
+  # Single image (treated as a 1-frame sequence)
   python inference.py --checkpoint checkpoints/fusion_best.pt --input face.jpg
 
-  # Video
+  # Video (samples seq_len frames and uses LSTM for temporal verdict)
   python inference.py --checkpoint checkpoints/fusion_best.pt --input video.mp4
 
-  # Folder of images
+  # Folder of images/videos
   python inference.py --checkpoint checkpoints/fusion_best.pt --input ./faces/
 """
 
@@ -27,7 +30,7 @@ import numpy as np
 from pathlib import Path
 from PIL import Image
 
-from dataset import build_eval_transforms, extract_frames, IMAGE_SIZE
+from dataset import VideoTransform, extract_frames, IMAGE_SIZE
 from fusion_model import DeepFakeFusionDetector
 
 
@@ -44,6 +47,7 @@ def load_model(checkpoint: str, device: torch.device,
     model = DeepFakeFusionDetector(
         swin_embed_dim=swin_embed_dim,
         gan_embed_dim=gan_embed_dim,
+        temporal_type="lstm",  # Ensure LSTM is used for temporal aggregation
     ).to(device)
     ckpt  = torch.load(checkpoint, map_location=device)
     state = ckpt.get("state", ckpt)
@@ -52,16 +56,26 @@ def load_model(checkpoint: str, device: torch.device,
     return model
 
 
-def predict_image(
+def predict_clip(
     model: DeepFakeFusionDetector,
-    img: Image.Image,
-    transform,
+    pil_images: list[Image.Image],
+    transform: VideoTransform,
     device: torch.device,
     threshold: float = 0.5,
 ) -> dict:
-    tensor = transform(img).unsqueeze(0).to(device)  # (1, 3, 224, 224)
+    """
+    Runs inference on a list of PIL Images (a video clip).
+    Uses the VideoTransform to apply consistent spatial augmentations,
+    then stacks into (1, seq_len, 3, H, W) for the LSTM-based model.
+    """
+    # Transform returns a list of tensors
+    tensors = transform(pil_images)
+    # Stack and add batch dimension: (seq_len, 3, H, W) -> (1, seq_len, 3, H, W)
+    clip_tensor = torch.stack(tensors).unsqueeze(0).to(device)
+    
     with torch.no_grad():
-        logit = model(tensor)
+        logit = model(clip_tensor)
+        
     prob = logit.sigmoid().item()
     fake = prob >= threshold
     return {
@@ -71,42 +85,14 @@ def predict_image(
     }
 
 
-def aggregate_video_results(frame_results: list, strategy: str = "mean") -> dict:
-    """
-    Aggregate per-frame predictions into a single video-level verdict.
-
-    strategy:
-      'mean'    — average P(fake) across frames
-      'max'     — if any frame is highly fake, flag the video
-      'majority' — majority vote
-    """
-    probs = [r["probability"] for r in frame_results]
-    if strategy == "mean":
-        agg_prob = float(np.mean(probs))
-    elif strategy == "max":
-        agg_prob = float(np.max(probs))
-    else:  # majority
-        votes    = [1 if r["label"] == "FAKE" else 0 for r in frame_results]
-        agg_prob = float(np.mean(votes))
-
-    fake = agg_prob >= 0.5
-    return {
-        "label":         "FAKE" if fake else "REAL",
-        "probability":   agg_prob,
-        "confidence":    agg_prob if fake else 1.0 - agg_prob,
-        "n_frames":      len(frame_results),
-        "n_fake_frames": sum(1 for r in frame_results if r["label"] == "FAKE"),
-        "strategy":      strategy,
-    }
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 #  Main inference functions
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run_on_image(path: str, model, transform, device, threshold: float) -> dict:
     img    = Image.open(path).convert("RGB")
-    result = predict_image(model, img, transform, device, threshold)
+    # Treat a single image as a 1-frame video sequence
+    result = predict_clip(model, [img], transform, device, threshold)
     result["path"] = path
     return result
 
@@ -118,21 +104,39 @@ def run_on_video(
     device,
     threshold: float,
     max_frames: int = 30,
-    strategy: str = "mean",
+    seq_len: int = 8,
 ) -> dict:
     import tempfile, shutil
     tmp_dir = tempfile.mkdtemp()
     try:
+        # 1. Extract up to max_frames from the video
         frame_paths = extract_frames(path, tmp_dir, max_frames=max_frames)
         if not frame_paths:
             return {"path": path, "error": "No frames extracted"}
-        frame_results = [
-            run_on_image(fp, model, transform, device, threshold)
-            for fp in frame_paths
-        ]
-        result = aggregate_video_results(frame_results, strategy=strategy)
+            
+        all_images = [Image.open(fp).convert("RGB") for fp in frame_paths]
+        
+        # 2. Sample seq_len frames uniformly (just like the Dataset)
+        if len(all_images) >= seq_len:
+            indices = np.linspace(0, len(all_images) - 1, seq_len, dtype=int)
+            sampled_images = [all_images[i] for i in indices]
+        else:
+            # Pad with the last frame if video is too short
+            sampled_images = all_images + [all_images[-1]] * (seq_len - len(all_images))
+
+        # 3. Get the primary video-level prediction using the sequence
+        result = predict_clip(model, sampled_images, transform, device, threshold)
         result["path"] = path
-        result["frame_results"] = frame_results
+        result["total_frames"] = len(all_images)
+        
+        # 4. (Optional but helpful) Per-frame breakdown using 1-frame sequences
+        frame_results = []
+        for img in all_images:
+            frame_res = predict_clip(model, [img], transform, device, threshold)
+            frame_results.append(frame_res)
+            
+        result["n_fake_frames"] = sum(1 for r in frame_results if r["label"] == "FAKE")
+        
         return result
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -161,11 +165,11 @@ def print_result(result: dict):
     verdict = "🔴 FAKE" if label == "FAKE" else "🟢 REAL"
     print(f"\n{'─'*50}")
     print(f"  File       : {os.path.basename(path)}")
-    print(f"  Verdict    : {verdict}")
+    print(f"  Verdict    : {verdict} (Sequence Aggregated)")
     print(f"  P(fake)    : {prob:.1f}%")
     print(f"  Confidence : {conf:.1f}%")
-    if "n_frames" in result:
-        print(f"  Frames     : {result['n_frames']}  ({result['n_fake_frames']} flagged fake)")
+    if "total_frames" in result:
+        print(f"  Frames     : {result['total_frames']}  ({result['n_fake_frames']} flagged fake individually)")
     print(f"{'─'*50}")
 
 
@@ -183,10 +187,9 @@ def parse_args():
     p.add_argument("--swin_embed_dim", type=int, default=96)
     p.add_argument("--gan_embed_dim",  type=int, default=64)
     p.add_argument("--max_frames",     type=int, default=30,
-                   help="Max frames to sample from a video")
-    p.add_argument("--strategy",       type=str, default="mean",
-                   choices=["mean", "max", "majority"],
-                   help="Video aggregation strategy")
+                   help="Max frames to extract from disk per video")
+    p.add_argument("--seq_len",        type=int, default=8,
+                   help="Number of frames to feed to model LSTM per video")
     p.add_argument("--save_json",      type=str, default=None,
                    help="Optionally save full results to JSON")
     return p.parse_args()
@@ -200,7 +203,9 @@ def main():
     print(f"Device: {device}")
 
     model     = load_model(args.checkpoint, device, args.swin_embed_dim, args.gan_embed_dim)
-    transform = build_eval_transforms(enhance=False)
+    # Use VideoTransform for consistent sequence processing
+    transform = VideoTransform(is_train=False, enhance=False)
+    
     inp       = args.input
     results   = []
 
@@ -210,7 +215,7 @@ def main():
             print_result(r)
     elif Path(inp).suffix.lower() in VIDEO_EXTS:
         r = run_on_video(inp, model, transform, device, args.threshold,
-                         args.max_frames, args.strategy)
+                         args.max_frames, args.seq_len)
         print_result(r)
         results = [r]
     elif Path(inp).suffix.lower() in IMAGE_EXTS:
@@ -223,7 +228,6 @@ def main():
 
     if args.save_json:
         import json
-        # Remove non-serialisable frame_results images
         clean = []
         for r in results:
             rc = {k: v for k, v in r.items() if k != "frame_results"}

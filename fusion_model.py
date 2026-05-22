@@ -2,22 +2,33 @@
 fusion_model.py
 ===============
 Fusion Detector — combines Swin Transformer + GAN Discriminator features
-to classify an image/video frame as Real or Fake.
+to classify a video sequence as Real or Fake.
 
-Architecture (matches the flow diagram):
-  ┌─────────────────────┐    ┌──────────────────────────┐
-  │  Swin Transformer   │    │  GAN Discriminator       │
-  │  (global attention) │    │  (synthesis artefacts)   │
-  └────────┬────────────┘    └────────────┬─────────────┘
-           │  feat_swin (768)             │  feat_gan (256)
-           └─────────────┬───────────────┘
-                    Concatenate  (1024)
-                         │
-                  Fusion MLP Head
-                         │
-                  Logit  → sigmoid
-                         │
-              Real / Fake + confidence
+Architecture (updated for video sequences):
+  Input: (B, seq_len, 3, 224, 224)
+           │
+           └─► Reshape to (B * seq_len, 3, 224, 224)
+                │
+    ┌───────────┴────────────┐
+    │  Swin Transformer      │  GAN Discriminator
+    │  (global attention)    │  (synthesis artefacts)
+    └───────────┬────────────┘
+                │  feat_swin (768)   │  feat_gan (256)
+                └───────────┬────────┘
+                     Concatenate  (1024)
+                            │
+               Reshape to (B, seq_len, 1024)
+                            │
+                   Temporal Aggregation
+                   (Bi-LSTM or Avg Pool)
+                            │
+                     Video Feature (1024)
+                            │
+                     Fusion MLP Head
+                            │
+                     Logit  → sigmoid
+                            │
+                Real / Fake + confidence
 """
 
 import torch
@@ -35,7 +46,7 @@ from gan import DeepfakeDiscriminator
 class DeepFakeFusionDetector(nn.Module):
     """
     Combines Swin Transformer features and GAN Discriminator features via
-    concatenation, then classifies Real / Fake.
+    concatenation, aggregates temporal information, then classifies Real / Fake.
 
     Parameters
     ----------
@@ -44,12 +55,14 @@ class DeepFakeFusionDetector(nn.Module):
     gan_embed_dim  : int
         Base embedding dimension for the GAN backbone (default 64).
     freeze_swin    : bool
-        If True, Swin weights are frozen (useful when loading a pre-trained
-        Swin checkpoint and only training the fusion head).
+        If True, Swin weights are frozen.
     freeze_gan     : bool
         If True, GAN discriminator weights are frozen.
     dropout        : float
         Dropout rate in the fusion MLP.
+    temporal_type  : str
+        Method to aggregate frame features into video features. 
+        Options: 'lstm' (recommended) or 'avg_pool'.
     """
 
     def __init__(
@@ -59,6 +72,7 @@ class DeepFakeFusionDetector(nn.Module):
         freeze_swin:    bool = False,
         freeze_gan:     bool = False,
         dropout:        float = 0.4,
+        temporal_type:  str = "lstm",
     ):
         super().__init__()
 
@@ -78,9 +92,24 @@ class DeepFakeFusionDetector(nn.Module):
             for p in self.gan_disc.parameters():
                 p.requires_grad_(False)
 
-        # ── Fusion MLP ────────────────────────────────────────────────────────
+        # ── Temporal Aggregation ──────────────────────────────────────────────
         fused_dim = swin_feat_dim + gan_feat_dim       # 768 + 256 = 1024
+        self.temporal_type = temporal_type.lower()
 
+        if self.temporal_type == "lstm":
+            # Bidirectional LSTM: input 1024 -> output 512*2 = 1024
+            self.temporal_lstm = nn.LSTM(
+                input_size=fused_dim,
+                hidden_size=fused_dim // 2,
+                num_layers=1,
+                batch_first=True,
+                bidirectional=True
+            )
+        elif self.temporal_type != "avg_pool":
+            raise ValueError("temporal_type must be 'lstm' or 'avg_pool'")
+
+        # ── Fusion MLP ────────────────────────────────────────────────────────
+        # Input remains 1024 because LSTM output is 1024 (512*2) or avg_pool keeps 1024
         self.fusion_head = nn.Sequential(
             nn.LayerNorm(fused_dim),
             nn.Linear(fused_dim, 512),
@@ -106,11 +135,11 @@ class DeepFakeFusionDetector(nn.Module):
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _get_swin_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract Swin Transformer features: (B, 768)."""
+        """Extract Swin Transformer features: (B*T, 768)."""
         return self.swin.forward_features(x)
 
     def _get_gan_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract GAN Discriminator backbone features: (B, 256).
+        """Extract GAN Discriminator backbone features: (B*T, 256).
         Expects x in [0, 1]; converts to [-1, 1] internally."""
         x_norm = x * 2.0 - 1.0          # [0,1] → [-1,1]
         return self.gan_disc.backbone(x_norm)
@@ -121,16 +150,37 @@ class DeepFakeFusionDetector(nn.Module):
         """
         Parameters
         ----------
-        x : (B, 3, 224, 224) float tensor in [0, 1]
+        x : (B, T, 3, 224, 224) float tensor in [0, 1]
+            B = batch size, T = sequence length (frames per video)
 
         Returns
         -------
         logits : (B, 1)  — apply sigmoid to get P(fake)
         """
-        feat_swin = self._get_swin_features(x)   # (B, 768)
-        feat_gan  = self._get_gan_features(x)    # (B, 256)
-        fused     = torch.cat([feat_swin, feat_gan], dim=-1)   # (B, 1024)
-        return self.fusion_head(fused)
+        B, T, C, H, W = x.shape
+        
+        # Combine batch and time dimensions to pass through 2D backbones
+        x_2d = x.view(B * T, C, H, W)
+        
+        # Extract spatial features per frame
+        feat_swin = self._get_swin_features(x_2d)   # (B*T, 768)
+        feat_gan  = self._get_gan_features(x_2d)    # (B*T, 256)
+        
+        fused_2d = torch.cat([feat_swin, feat_gan], dim=-1) # (B*T, 1024)
+        
+        # Reshape back to sequence format
+        fused_seq = fused_2d.view(B, T, -1) # (B, T, 1024)
+        
+        # Aggregate temporal information
+        if self.temporal_type == "lstm":
+            _, (hn, _) = self.temporal_lstm(fused_seq)
+            # hn shape: (num_layers * num_directions, B, hidden_size)
+            # For bidirectional, concatenate final forward and backward hidden states
+            hidden = torch.cat((hn[0], hn[1]), dim=-1) # (B, 1024)
+        else: # avg_pool
+            hidden = fused_seq.mean(dim=1) # (B, 1024)
+            
+        return self.fusion_head(hidden)
 
     def predict(self, x: torch.Tensor, threshold: float = 0.5) -> dict:
         """
@@ -199,6 +249,7 @@ def main():
     model = DeepFakeFusionDetector(
         swin_embed_dim=96,
         gan_embed_dim=64,
+        temporal_type="lstm",   # Test LSTM temporal aggregation
     ).to(device)
 
     total = sum(p.numel() for p in model.parameters())
@@ -206,10 +257,10 @@ def main():
     print(f"Total params    : {total:,}")
     print(f"Trainable params: {trainable:,}")
 
-    # Forward pass
-    x = torch.rand(2, 3, 224, 224).to(device)   # [0, 1] normalized
+    # Forward pass for video sequences: (Batch=2, Seq_Len=8, Channels=3, H=224, W=224)
+    x = torch.rand(2, 8, 3, 224, 224).to(device)   # [0, 1] normalized
     logits = model(x)
-    print(f"Logits shape: {logits.shape}")       # (2, 1)
+    print(f"Logits shape: {logits.shape}")           # Expected: (2, 1)
 
     result = model.predict(x)
     print(f"Predictions : {result['prediction']}")

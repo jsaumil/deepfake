@@ -5,12 +5,9 @@ Swin Transformer feature extractor for DeepFake detection.
 Input : (B, 3, H, W)  — RGB face images, H=W=224 recommended
 Output: (B, feature_dim)  — pooled feature vector
 
-Changes from original:
-  - Fixed ShiftedWindowMSA to accept `mask` parameter
-  - Fixed SwinEncoderBlock to pass `mask` to WMSA
-  - Added cyclic-shift masking for shifted windows
-  - Added `forward_features()` to return pooled embeddings
-  - Added `SwinTransformerDetector` wrapper for classification
+UPDATED: 
+  - Fixed ShiftedWindowMSA forward pass (removed duplicate QKV projections)
+  - Added temporal sequence processing (B, T, 3, H, W) to standalone detector
 """
 
 import math
@@ -142,33 +139,14 @@ class ShiftedWindowMSA(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, L, C = x.shape
         height = width = int(math.sqrt(L))
-        h_dim = C // self.num_heads
 
-        # (1) cyclic shift
+        # (1) Cyclic shift
         if self.shift > 0:
             x = rearrange(x, 'b (h w) c -> b h w c', h=height, w=width)
             x = torch.roll(x, shifts=(-self.shift, -self.shift), dims=(1, 2))
             x = rearrange(x, 'b h w c -> b (h w) c')
 
-        # (2) QKV projection
-        qkv = self.proj1(x)  # (B, L, 3C)
-
-        # (3) Partition into windows
-        qkv = rearrange(qkv, 'b (h w) (k H d) -> k (b h w) H (d) 1',
-                        h=height // self.window_size,
-                        w=width // self.window_size,
-                        H=self.num_heads, k=3)
-
-        # Reinterpret window tokens
-        qkv = rearrange(
-            self.proj1(rearrange(x, 'b (h w) c -> b h w c', h=height, w=width)
-                       .unfold(1, self.window_size, self.window_size)
-                       .unfold(2, self.window_size, self.window_size)
-                       .reshape(B, -1, self.window_size * self.window_size, C)),
-            'b nw ws c -> b nw ws c'
-        )
-
-        # Simpler: reshape manually
+        # (2) Partition into windows
         x_2d = rearrange(x, 'b (h w) c -> b h w c', h=height, w=width)
         x_win = rearrange(
             x_2d,
@@ -176,18 +154,19 @@ class ShiftedWindowMSA(nn.Module):
             m1=self.window_size, m2=self.window_size,
         )  # (B*num_windows, ws², C)
 
+        # (3) QKV projection
         qkv_win = self.proj1(x_win)  # (B*nw, ws², 3C)
         Q, K, V = qkv_win.chunk(3, dim=-1)
 
-        # Reshape for multi-head
+        # Reshape for multi-head attention
         def split_heads(t):
             BN, N, c = t.shape
             return t.view(BN, N, self.num_heads, c // self.num_heads).transpose(1, 2)
 
         Q, K, V = split_heads(Q), split_heads(K), split_heads(V)
 
-        # Attention
-        att = (Q @ K.transpose(-2, -1)) / math.sqrt(h_dim)
+        # (4) Scaled Dot-Product Attention
+        att = (Q @ K.transpose(-2, -1)) / math.sqrt(self.embed_dim // self.num_heads)
 
         # Relative position bias
         N = self.window_size ** 2
@@ -208,7 +187,7 @@ class ShiftedWindowMSA(nn.Module):
         out = att @ V  # (B*nw, num_heads, N, head_dim)
         out = out.transpose(1, 2).reshape(out.shape[0], N, C)
 
-        # Reverse window partition
+        # (5) Reverse window partition
         num_win_h = height // self.window_size
         num_win_w = width // self.window_size
         out = rearrange(
@@ -218,7 +197,7 @@ class ShiftedWindowMSA(nn.Module):
             m1=self.window_size, m2=self.window_size,
         )
 
-        # (4) Reverse cyclic shift
+        # (6) Reverse cyclic shift
         if self.shift > 0:
             out = torch.roll(out, shifts=(self.shift, self.shift), dims=(1, 2))
 
@@ -320,14 +299,25 @@ class SwinTransformer(nn.Module):
 
 class SwinTransformerDetector(nn.Module):
     """
-    Swin-T + classification head for binary deepfake detection.
+    Swin-T + Temporal Aggregation + classification head for binary deepfake detection.
+    Input : (B, T, 3, 224, 224) video sequence OR (B, 3, 224, 224) single image
     Output: logits (B, 1)  — use BCEWithLogitsLoss
     """
 
-    def __init__(self, embed_dim: int = 96, window_size: int = 7):
+    def __init__(self, embed_dim: int = 96, window_size: int = 7, temporal_type: str = "lstm"):
         super().__init__()
         self.backbone = SwinTransformer(embed_dim=embed_dim, window_size=window_size)
         feat_dim = embed_dim * 8          # 768
+        self.temporal_type = temporal_type.lower()
+
+        if self.temporal_type == "lstm":
+            self.temporal_lstm = nn.LSTM(
+                input_size=feat_dim,
+                hidden_size=feat_dim // 2,
+                num_layers=1,
+                batch_first=True,
+                bidirectional=True
+            )
 
         self.head = nn.Sequential(
             nn.Linear(feat_dim, 256),
@@ -337,7 +327,23 @@ class SwinTransformerDetector(nn.Module):
         )
 
     def forward_features(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone.forward_features(x)
+        # Handle 5D video sequence input (B, T, 3, H, W)
+        if x.ndim == 5:
+            B, T, C, H, W = x.shape
+            x_2d = x.view(B * T, C, H, W)
+            feat_2d = self.backbone.forward_features(x_2d)  # (B*T, 768)
+            feat_seq = feat_2d.view(B, T, -1)               # (B, T, 768)
+
+            if self.temporal_type == "lstm":
+                _, (hn, _) = self.temporal_lstm(feat_seq)
+                # Concatenate final forward and backward hidden states
+                hidden = torch.cat((hn[0], hn[1]), dim=-1)  # (B, 768)
+            else:  # avg_pool
+                hidden = feat_seq.mean(dim=1)                # (B, 768)
+            return hidden
+        else:
+            # Fallback to 2D single image input (B, 3, H, W)
+            return self.backbone.forward_features(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(self.forward_features(x))
@@ -348,14 +354,17 @@ class SwinTransformerDetector(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    x = torch.randn(2, 3, 224, 224)
-    model = SwinTransformer()
-    feats = model(x)
-    print(f"SwinTransformer output shape: {feats.shape}")   # (2, 768)
+    # Test 2D Image Pass
+    x_img = torch.randn(2, 3, 224, 224)
+    model_img = SwinTransformer()
+    feats = model_img(x_img)
+    print(f"SwinTransformer 2D output shape: {feats.shape}")   # (2, 768)
 
-    detector = SwinTransformerDetector()
-    logits = detector(x)
-    print(f"SwinTransformerDetector logits shape: {logits.shape}")  # (2, 1)
+    # Test Standalone Detector on Video Sequence
+    x_vid = torch.randn(2, 4, 3, 224, 224)  # B=2, T=4
+    detector = SwinTransformerDetector(temporal_type="lstm")
+    logits = detector(x_vid)
+    print(f"SwinTransformerDetector 5D logits shape: {logits.shape}")  # (2, 1)
 
 
 if __name__ == '__main__':

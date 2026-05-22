@@ -12,6 +12,10 @@ Discriminator: uses a lightweight Swin-based feature extractor
 The Discriminator's feature extractor is shared with the fusion model,
 so pre-training it adversarially gives the detector a strong starting
 point for spotting synthesis artefacts.
+
+UPDATED: GAN trainer now natively supports the video sequence DataLoader
+         (B, T, 3, 224, 224) by flattening sequences into independent 
+         2D frames for standard 2D GAN pre-training.
 """
 
 import math
@@ -210,7 +214,7 @@ class SwinBackbone(nn.Module):
         x = self.stage1(x)
         x, H, W = self.merge1(x, H, W)
         x = self.stage2(x)
-        x, H, W = self.merge2(x, H, W)
+        x, H, W = self.merge2(x, W)
         x = self.stage3(x)
         x = self.norm(x)
         return x.mean(dim=1)                        # (B, out_dim)
@@ -277,7 +281,7 @@ class DeepfakeDiscriminator(nn.Module):
     to output P(real) logit.
 
     The `get_features()` method exposes the backbone output for the
-    downstream fusion model.
+    downstream fusion model. Expects 2D image inputs (B, 3, 224, 224).
     """
 
     def __init__(
@@ -336,6 +340,9 @@ class DeepfakeGAN:
     Pre-training the GAN on real face images forces the Discriminator
     backbone to learn synthesis artefact patterns, giving a warm-started
     feature extractor for the downstream fusion detector.
+    
+    UPDATED: Now handles video sequence batches (B, T, 3, 224, 224) directly
+    by flattening them into independent frames for 2D GAN training.
     """
 
     def __init__(
@@ -367,23 +374,36 @@ class DeepfakeGAN:
 
     # ── single mini-batch step ───────────────────────────────────────────────
 
-    def train_step(self, real_imgs: torch.Tensor) -> dict:
-        B = real_imgs.size(0)
+    def train_step(self, real_batch: torch.Tensor) -> dict:
+        """
+        Performs a single GAN training step.
+        Accepts either (B, 3, H, W) images or (B, T, 3, H, W) video sequences.
+        If video sequences are passed, they are flattened to (B*T, 3, H, W) 
+        and treated as independent frames for 2D GAN training.
+        """
+        # Flatten video sequences into individual frames
+        if real_batch.ndim == 5:
+            B, T, C, H, W = real_batch.shape
+            real_imgs = real_batch.view(B * T, C, H, W)
+        else:
+            real_imgs = real_batch
+            
         real_imgs = real_imgs.to(self.device)
+        N = real_imgs.size(0)  # Actual batch size (B*T or B)
 
         # ── Discriminator ──
         self.opt_D.zero_grad()
-        d_real = self.criterion(self.D(real_imgs), self._real_labels(B))
-        z      = torch.randn(B, self.latent_dim, device=self.device)
-        d_fake = self.criterion(self.D(self.G(z).detach()), self._fake_labels(B))
+        d_real = self.criterion(self.D(real_imgs), self._real_labels(N))
+        z      = torch.randn(N, self.latent_dim, device=self.device)
+        d_fake = self.criterion(self.D(self.G(z).detach()), self._fake_labels(N))
         d_loss = (d_real + d_fake) * 0.5
         d_loss.backward()
         self.opt_D.step()
 
         # ── Generator ──
         self.opt_G.zero_grad()
-        z      = torch.randn(B, self.latent_dim, device=self.device)
-        g_loss = self.criterion(self.D(self.G(z)), self._real_labels(B, smooth=1.0))
+        z      = torch.randn(N, self.latent_dim, device=self.device)
+        g_loss = self.criterion(self.D(self.G(z)), self._real_labels(N, smooth=1.0))
         g_loss.backward()
         self.opt_G.step()
 
@@ -398,8 +418,8 @@ class DeepfakeGAN:
         self.G.train(); self.D.train()
         totals, n = {"d_loss": 0.0, "g_loss": 0.0}, 0
         pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=False)
-        for imgs, _ in pbar:
-            stats = self.train_step(imgs)
+        for batch, _ in pbar:
+            stats = self.train_step(batch)
             for k in totals: totals[k] += stats[k]
             n += 1
             pbar.set_postfix(D=f"{stats['d_loss']:.3f}", G=f"{stats['g_loss']:.3f}")
@@ -420,10 +440,15 @@ class DeepfakeGAN:
         return self.G(torch.randn(n, self.latent_dim, device=self.device))
 
     @torch.no_grad()
-    def score(self, imgs: torch.Tensor) -> torch.Tensor:
-        """P(real) for each image: (B,)."""
+    def score(self, batch: torch.Tensor) -> torch.Tensor:
+        """P(real) for each image. Accepts (B, 3, H, W) or (B, T, 3, H, W)."""
         self.D.eval()
-        return self.D(imgs.to(self.device)).sigmoid().squeeze(-1)
+        if batch.ndim == 5:
+            B, T, C, H, W = batch.shape
+            batch = batch.view(B * T, C, H, W)
+            scores = self.D(batch.to(self.device)).sigmoid().squeeze(-1)
+            return scores.view(B, T)
+        return self.D(batch.to(self.device)).sigmoid().squeeze(-1)
 
     def save(self, path_prefix: str = "checkpoints/gan") -> None:
         import os; os.makedirs(path_prefix, exist_ok=True)
@@ -452,7 +477,7 @@ def main():
     print(f"Generator params   : {g_params:,}")
     print(f"Discriminator params: {d_params:,}")
 
-    # Shape check
+    # Shape check (Image)
     z      = torch.randn(2, 256, device=device)
     fake   = gan.G(z)
     print(f"Generator output   : {fake.shape}")   # (2, 3, 224, 224)
@@ -462,6 +487,11 @@ def main():
 
     feats  = gan.D.get_features(fake)
     print(f"Backbone features  : {feats.shape}")   # (2, 256)
+
+    # Shape check (Video sequence from DataLoader)
+    video_batch = torch.randn(2, 4, 3, 224, 224, device=device) # B=2, T=4
+    stats = gan.train_step(video_batch)
+    print(f"Train step (video) : D_loss={stats['d_loss']:.3f}, G_loss={stats['g_loss']:.3f}")
 
 
 if __name__ == "__main__":
