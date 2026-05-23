@@ -214,7 +214,7 @@ class SwinBackbone(nn.Module):
         x = self.stage1(x)
         x, H, W = self.merge1(x, H, W)
         x = self.stage2(x)
-        x, H, W = self.merge2(x, W)
+        x, H, W = self.merge2(x, H, W)
         x = self.stage3(x)
         x = self.norm(x)
         return x.mean(dim=1)                        # (B, out_dim)
