@@ -91,7 +91,8 @@ async def main():
     llm = ChatOllama(
         base_url="https://e685-35-227-50-23.ngrok-free.app",
         model="glm-4.7-flash:latest",
-        think=False
+        think=False,
+        client_kwargs={"verify": False}
     )
     
     # Bind our custom tools to the LLM
