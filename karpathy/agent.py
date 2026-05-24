@@ -1,3 +1,7 @@
+import ssl
+# Bypass SSL verification for Ngrok tunnels
+ssl._create_default_https_context = ssl._create_unverified_context
+
 from langchain_ollama.chat_models import ChatOllama
 from dotenv import load_dotenv
 import os
