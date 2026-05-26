@@ -312,7 +312,7 @@ def build_ff_dataloaders(
     loaders = {}
 
     for split_name, video_list in splits.items():
-        print(f"\n  → {split_name} split ({len(video_list)} videos):")
+        print(f"\n  -> {split_name} split ({len(video_list)} videos):")
         
         # Returns groups: [ ( [path1, path2...], label ), ... ]
         frame_groups = extract_video_frame_groups(
@@ -377,7 +377,7 @@ if __name__ == "__main__":
 if __name__ == "__main__":
     print("Running one-time data preparation...")
     loaders = build_ff_dataloaders(
-        data_root="./data",
+        data_root="karpathy\\FF++",
         frames_dir="./frames_cache",
         batch_size=4,
         seq_len=8,

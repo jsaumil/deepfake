@@ -1,68 +1,48 @@
-import ssl
-# Bypass SSL verification for Ngrok tunnels
-ssl._create_default_https_context = ssl._create_unverified_context
-
 from langchain_ollama.chat_models import ChatOllama
 from dotenv import load_dotenv
 import os
 import json
 import subprocess
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_core.messages import BaseMessage, ToolMessage, HumanMessage, AIMessage, SystemMessage
 from langgraph.prebuilt import ToolNode, tools_condition
 from typing import Annotated, TypedDict
 from langgraph.graph.message import add_messages
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import InMemorySaver
-from langchain_core.tools import tool
+from langchain_core.tools import tool  # <-- Import the tool decorator
 
-# Your project directory where train.py, prepare.py, and program.md live
-WORKSPACE = "/home/Digant_Parmar/deepfake/karpathy"
+# Your project directory
+WORKSPACE = "F:\projects\DeepFake\karpathy"
+
+SERVERS = {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        WORKSPACE
+      ]
+    }
+}
 
 class ChatState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  CUSTOM TOOLS (Replaces MCP Filesystem - No Node.js needed!)
+#  THE MISSING SUPERPOWER: Add a Bash Execution Tool
 # ──────────────────────────────────────────────────────────────────────────────
 
 @tool
-def read_file(filepath: str) -> str:
-    """Reads the content of a file. Use this to read program.md, train.py, or results.json."""
-    try:
-        # If the path is not absolute, assume it's in the workspace
-        if not os.path.isabs(filepath):
-            filepath = os.path.join(WORKSPACE, filepath)
-        
-        with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read()
-        # Truncate very large files so we don't overload the LLM context
-        if len(content) > 8000:
-            return content[:8000] + "\n... [File Truncated]"
-        return content
-    except Exception as e:
-        return f"Error reading file: {str(e)}"
-
-@tool
-def write_file(filepath: str, content: str) -> str:
-    """Writes content to a file. Use this to modify train.py or update experiment_log.md."""
-    try:
-        if not os.path.isabs(filepath):
-            filepath = os.path.join(WORKSPACE, filepath)
-            
-        with open(filepath, "w", encoding="utf-8") as f:
-            f.write(content)
-        return f"Successfully wrote to {filepath}"
-    except Exception as e:
-        return f"Error writing file: {str(e)}"
-
-@tool
-def run_bash_command(command: str) -> str:
+async def run_bash_command(command: str):
     """
     Runs a bash/shell command and returns the output. 
     Use this to run python scripts (e.g., 'python train.py').
     The command will run in the workspace directory.
     """
     try:
+        # Run the command in your project directory with a 15-minute timeout
         result = subprocess.run(
             command, 
             shell=True, 
@@ -72,7 +52,6 @@ def run_bash_command(command: str) -> str:
             timeout=900 # 15 minute timeout for 10-min training runs
         )
         output = f"EXIT CODE: {result.returncode}\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
-        
         # Truncate output if it's too long for the LLM context window
         if len(output) > 3000:
             output = output[-3000:] + "\n... [Output Truncated]"
@@ -80,22 +59,21 @@ def run_bash_command(command: str) -> str:
     except subprocess.TimeoutExpired:
         return "ERROR: Command timed out after 900 seconds."
 
-# List of all tools the agent can use
-all_tools = [read_file, write_file, run_bash_command]
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  LANGGRAPH AGENT SETUP
-# ──────────────────────────────────────────────────────────────────────────────
-
 async def main():
     llm = ChatOllama(
-        base_url="https://46f5-34-142-251-93.ngrok-free.app",
-        model="glm-4.7-flash:latest",
-        think=False,
-        client_kwargs={"verify": False}
+        base_url="https://1491-34-125-210-229.ngrok-free.app",
+        model="qwen2.5:14b",
+        think = False
     )
     
-    # Bind our custom tools to the LLM
+    # 1. Get MCP Filesystem tools
+    client = MultiServerMCPClient(SERVERS)
+    mcp_tools = await client.get_tools()
+    
+    # 2. Combine MCP tools with our custom Bash tool
+    all_tools = mcp_tools + [run_bash_command]
+
+    # 3. Bind ALL tools to the LLM
     llm_with_tools = llm.bind_tools(all_tools)
 
     async def chat_node(state: ChatState):
@@ -104,7 +82,7 @@ async def main():
         result = await llm_with_tools.ainvoke(messages)
         return {"messages": [result]}
 
-    # Pass ALL tools to the ToolNode
+    # 4. Pass ALL tools to the ToolNode
     tool_node = ToolNode(all_tools)
 
     graph = StateGraph(ChatState)
@@ -127,9 +105,8 @@ async def main():
     
     # This is the initial prompt that starts the whole process!
     initial_prompt = """
-    You are an autonomous AI deepfake detection researcher. 
-    Read the file `program.md` to understand your mission, rules, and how to run experiments.
-    Once you understand the rules, kick off your first experiment!
+    there is file name train.py in the current directory, which trains a deepfake detection model.
+    can u just start the training but running the code
     """
     
     result = await chatbot.ainvoke(
