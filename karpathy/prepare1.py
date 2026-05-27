@@ -254,17 +254,14 @@ class FaceForensicsVideoDataset(Dataset):
                 frame_paths[-1]
             ] * (self.seq_len - len(frame_paths))
 
-        frames = []
+        # Load all frames as PIL Images first
+        frames = [Image.open(path).convert("RGB") for path in frame_paths]
 
-        for path in frame_paths:
+        # Apply transform to the LIST of frames (VideoTransform expects a list)
+        if self.transform:
+            frames = self.transform(frames)  # Returns list of tensors
 
-            img = Image.open(path).convert("RGB")
-
-            if self.transform:
-                img = self.transform(img)
-
-            frames.append(img)
-
+        # Stack into [seq_len, 3, H, W]
         video = torch.stack(frames)
 
         return video, torch.tensor(label)

@@ -102,15 +102,91 @@ async def main():
     # ──────────────────────────────────────────────────────────────────────────────
     
     config1 = {"configurable": {"thread_id": "1"}}
+    system_prompt = """
+You are an autonomous AI deepfake detection researcher.
+
+The current directory contains:
+
+- train.py
+- results.json (generated after training)
+- experiment_log.md (create if missing)
+
+Your objective is to maximize the validation AUC score reported in results.json.
+
+Important rules:
+
+1. You may ONLY modify train.py.
+2. Do NOT modify prepare.py.
+3. Do NOT modify program.md.
+4. Training duration is fixed at approximately 10 minutes and must not be changed.
+5. The model receives video tensors with shape:
+   (B, 8, 3, 224, 224)
+
+Workflow:
+
+1. Inspect train.py and understand the current architecture.
+2. Run the training:
+      python train.py
+3. If execution fails:
+   - Read the error carefully.
+   - Fix small coding issues automatically.
+   - Install missing Python packages when required.
+   - Update train.py if necessary.
+   - Continue until training runs successfully.
+4. Wait for training completion.
+5. Read results.json.
+6. Extract val_auc.
+7. Record findings in experiment_log.md.
+
+After each completed experiment:
+
+- Analyze the result.
+- Propose a hypothesis for improvement.
+- Modify train.py with exactly one meaningful experiment.
+- Run training again.
+- Compare the new val_auc with previous results.
+- Keep the better approach.
+- Document every experiment in experiment_log.md.
+
+Possible areas to explore:
+
+- Swin Transformer dimensions
+- GAN backbone dimensions
+- Feature fusion strategies
+- Residual connections
+- Layer normalization
+- Attention mechanisms
+- Dropout values (0.1-0.5)
+- BiLSTM vs pooling approaches
+- AdamW, SGD, RMSProp
+- Learning rates:
+    1e-3
+    5e-4
+    1e-4
+    5e-5
+
+When encountering errors:
+
+- Never stop at the first failure.
+- Attempt to diagnose and repair the issue.
+- Retry execution after every fix.
+- Use shell commands whenever necessary.
+
+Goal:
+
+Continuously improve val_auc through iterative experimentation and maintain a complete experiment history in experiment_log.md.
+
+Start by inspecting train.py and launching the first training run.
+"""
     
     # This is the initial prompt that starts the whole process!
     initial_prompt = """
-    there is file name train.py in the current directory, which trains a deepfake detection model.
-    can u just start the training but running the code
+    do autoresearch on train.py to improve val_auc. 
+    Remember to follow the workflow and rules outlined in the system prompt.
     """
     
     result = await chatbot.ainvoke(
-        {"messages": [HumanMessage(content=initial_prompt)]}, 
+        {"messages": [SystemMessage(content=system_prompt),HumanMessage(content=initial_prompt)]}, 
         config=config1
     )
     

@@ -227,16 +227,45 @@ class DeepFakeFusionDetector(nn.Module):
         swin_ckpt:  str | None = None,
         gan_ckpt:   str | None = None,
     ) -> None:
-        """Load separately pre-trained backbone checkpoints."""
+        """Load separately pre-trained backbone checkpoints. 
+        Ignores layers if model dimensions have changed."""
         if swin_ckpt:
             state = torch.load(swin_ckpt, map_location="cpu")
-            self.swin.load_state_dict(state, strict=False)
-            print(f"Loaded Swin weights ← {swin_ckpt}")
+            model_state = self.swin.state_dict()
+            
+            # Only load weights where the shapes match perfectly
+            filtered_state = {
+                k: v for k, v in state.items() 
+                if k in model_state and v.shape == model_state[k].shape
+            }
+            self.swin.load_state_dict(filtered_state, strict=False)
+            
+            loaded = len(filtered_state)
+            total = len(state)
+            if loaded < total:
+                print(f"⚠️ Loaded Swin weights ← {swin_ckpt} ({loaded}/{total} params matched). "
+                      f"Dimension mismatch ignored.")
+            else:
+                print(f"✓ Loaded Swin weights ← {swin_ckpt}")
+                
         if gan_ckpt:
             state = torch.load(gan_ckpt, map_location="cpu")
-            self.gan_disc.load_state_dict(state, strict=False)
-            print(f"Loaded GAN-Disc weights ← {gan_ckpt}")
-
+            model_state = self.gan_disc.state_dict()
+            
+            # Only load weights where the shapes match perfectly
+            filtered_state = {
+                k: v for k, v in state.items() 
+                if k in model_state and v.shape == model_state[k].shape
+            }
+            self.gan_disc.load_state_dict(filtered_state, strict=False)
+            
+            loaded = len(filtered_state)
+            total = len(state)
+            if loaded < total:
+                print(f"⚠️ Loaded GAN-Disc weights ← {gan_ckpt} ({loaded}/{total} params matched). "
+                      f"Dimension mismatch ignored. Train from scratch for these layers.")
+            else:
+                print(f"✓ Loaded GAN-Disc weights ← {gan_ckpt}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Smoke test
